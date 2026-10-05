@@ -128,3 +128,44 @@ func TestApply_noRetryWhenStartSucceeds(t *testing.T) {
 		t.Fatal("a retry was scheduled for a target that started")
 	}
 }
+
+func TestSetIntendedStateDisabled_stopsRetry(t *testing.T) {
+	tm := newTargetsTestManager(t)
+	addr := freeAddr(t)
+
+	tm.apply("t1", retryTestConfig("t1", addr))
+	if st := tm.getTargetStateStr("t1"); st != collstore.StateFailed {
+		t.Fatalf("first start: state %q, want %q", st, collstore.StateFailed)
+	}
+	tm.SetIntendedState("t1", collstore.IntendedStateDisabled)
+
+	// Checked before the retry's first tick (100ms), so only the cancel
+	// itself can have cleared it.
+	mt := tm.Lookup("t1")
+	mt.RLock()
+	pending := mt.retryCancel != nil
+	mt.RUnlock()
+	if pending {
+		t.Fatal("retry still scheduled after the target was disabled")
+	}
+
+	// A disabled target must stay down when its device appears.
+	serveGNMI(t, addr)
+	time.Sleep(500 * time.Millisecond)
+	if st := tm.getTargetStateStr("t1"); st == collstore.StateRunning {
+		t.Fatalf("disabled target was started by a retry")
+	}
+}
+
+func TestSetIntendedStateEnabled_retriesWhenStartFails(t *testing.T) {
+	tm := newTargetsTestManager(t)
+	addr := freeAddr(t)
+
+	tm.apply("t1", retryTestConfig("t1", addr))
+	tm.SetIntendedState("t1", collstore.IntendedStateDisabled)
+	// Re-enabled while the device is still down: this start fails too.
+	tm.SetIntendedState("t1", collstore.IntendedStateEnabled)
+
+	serveGNMI(t, addr)
+	waitForState(t, tm, "t1", collstore.StateRunning, 5*time.Second)
+}

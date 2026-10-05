@@ -860,7 +860,10 @@ func (tm *TargetsManager) SetIntendedState(name string, state string) bool {
 		if currentState == collstore.StateRunning || currentState == collstore.StateStarting {
 			return false
 		}
-		_ = tm.start(mt)
+		if err := tm.start(mt); err != nil {
+			mt.setLastError(err.Error())
+			tm.scheduleRetry(mt)
+		}
 	case collstore.IntendedStateDisabled:
 		mt.cancelRetry()
 		if currentState == collstore.StateStopped || currentState == collstore.StateStopping {
