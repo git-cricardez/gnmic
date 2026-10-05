@@ -32,6 +32,10 @@ import (
 
 const (
 	subscriptionReaderStopTimeout = 5 * time.Second
+	// defaultTargetRetryTimer is how long a target that failed to start waits
+	// before the next attempt when its config sets no retry-timer, the same
+	// default the classic (non-collector) target loop uses.
+	defaultTargetRetryTimer = 10 * time.Second
 )
 
 type ManagedTarget struct {
@@ -55,6 +59,9 @@ type ManagedTarget struct {
 	// Immutable event-tags snapshot. Replaced (never mutated) under mt.Lock
 	// when the target is created, reconnected, or tags are updated in place.
 	eventTags map[string]string
+	// retryCancel stops the pending retry of a target whose start failed;
+	// nil when no retry is scheduled. Protected by mt.Lock.
+	retryCancel context.CancelFunc
 }
 
 func (mt *ManagedTarget) setLastError(msg string) {
@@ -353,6 +360,7 @@ func (tm *TargetsManager) apply(name string, cfg *types.TargetConfig) {
 			tm.logger.Error("failed to start target", "name", name, "error", err)
 			mt.setLastError(err.Error())
 			tm.setTargetState(name, collstore.StateFailed)
+			tm.scheduleRetry(mt)
 			return
 		}
 		mt.clearLastError()
@@ -455,6 +463,84 @@ func (tm *TargetsManager) apply(name string, cfg *types.TargetConfig) {
 		tm.logger.Error("failed to start target", "name", name, "error", err)
 		mt.setLastError(err.Error())
 		tm.setTargetState(name, collstore.StateFailed)
+		tm.scheduleRetry(mt)
+	}
+}
+
+// scheduleRetry restarts a target whose start failed, every retry-timer
+// until it starts. Without it a target whose first dial fails (a device still
+// booting) stays Failed for good: apply returns early on an unchanged config,
+// so nothing would start it again. The retry ends when the target starts, is
+// removed or replaced, is disabled, or is no longer Failed. Callers hold
+// mt.Lock.
+func (tm *TargetsManager) scheduleRetry(mt *ManagedTarget) {
+	if mt.retryCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(tm.ctx)
+	mt.retryCancel = cancel
+	go tm.retryLoop(ctx, mt)
+}
+
+func (tm *TargetsManager) retryLoop(ctx context.Context, mt *ManagedTarget) {
+	for {
+		mt.RLock()
+		delay := defaultTargetRetryTimer
+		if mt.T != nil && mt.T.Config != nil && mt.T.Config.RetryTimer > 0 {
+			delay = mt.T.Config.RetryTimer
+		}
+		mt.RUnlock()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		tm.mu.RLock()
+		current := tm.targets[mt.Name]
+		tm.mu.RUnlock()
+
+		mt.Lock()
+		done := func() bool {
+			if ctx.Err() != nil {
+				return true
+			}
+			if current != mt || mt.T == nil {
+				return true // removed or replaced
+			}
+			if tm.GetIntendedState(mt.Name) == collstore.IntendedStateDisabled {
+				return true
+			}
+			if tm.getTargetStateStr(mt.Name) != collstore.StateFailed {
+				return true
+			}
+			tm.logger.Info("retrying failed target", "name", mt.Name)
+			// close the half-open client a failed start leaves behind
+			_ = tm.stop(mt)
+			if err := tm.start(mt); err != nil {
+				tm.logger.Error("failed to start target", "name", mt.Name, "error", err)
+				mt.setLastError(err.Error())
+				tm.setTargetState(mt.Name, collstore.StateFailed)
+				return false
+			}
+			tm.logger.Info("target started after retry", "name", mt.Name)
+			return true
+		}()
+		if done {
+			mt.retryCancel = nil
+			mt.Unlock()
+			return
+		}
+		mt.Unlock()
+	}
+}
+
+// cancelRetry stops a pending retry. Callers hold mt.Lock.
+func (mt *ManagedTarget) cancelRetry() {
+	if mt.retryCancel != nil {
+		mt.retryCancel()
+		mt.retryCancel = nil
 	}
 }
 
@@ -641,6 +727,7 @@ func (tm *TargetsManager) remove(name string) {
 	tm.mu.Unlock()
 	if mt != nil {
 		mt.Lock()
+		mt.cancelRetry()
 		_ = tm.stop(mt)
 		mt.T = nil
 		mt.outputs = nil
@@ -775,6 +862,7 @@ func (tm *TargetsManager) SetIntendedState(name string, state string) bool {
 		}
 		_ = tm.start(mt)
 	case collstore.IntendedStateDisabled:
+		mt.cancelRetry()
 		if currentState == collstore.StateStopped || currentState == collstore.StateStopping {
 			return false
 		}
